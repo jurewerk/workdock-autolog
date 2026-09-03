@@ -1,0 +1,6 @@
+# Never commit real credentials or per-machine state.
+*.conf
+!*.conf.example
+.env
+session-cookies
+*.log

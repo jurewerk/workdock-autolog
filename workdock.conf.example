@@ -1,0 +1,18 @@
+# Copy to ~/.workdock.conf and chmod 600 — this file holds a password.
+
+# Your Workdock instance, and the task every entry is filed under. Both required:
+# they differ per deployment, so the tool ships with neither.
+WORKDOCK_BASE=https://workdock.example.com
+WORKDOCK_TASK_ID=
+
+WORKDOCK_EMAIL=you@example.com
+WORKDOCK_PASSWORD=your-password
+
+# Workdock encrypts credentials in the browser before login, so the tool has to do
+# the same. 32-character AES key — the app's VITE_ENCRYPTION_KEY, readable from its
+# built JS bundle.
+WORKDOCK_CIPHER_KEY=................................
+
+# Alternatives to email+password:
+#   WORKDOCK_EMAIL_ENC + WORKDOCK_PASSWORD_ENC   pre-encrypted pair
+#   WORKDOCK_COOKIE                              full Cookie: header from the browser

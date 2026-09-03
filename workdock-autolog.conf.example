@@ -1,0 +1,11 @@
+# Copy to ~/.workdock-autolog.conf and chmod 600.
+#
+# Repos whose commits count toward the daily total. Comma- or newline-separated;
+# ~ is expanded. A path with no .git directory is skipped silently.
+REPOS=~/projects/your-project,~/projects/another-project
+
+# Git author to match, exactly as it appears in `git log --author`. Required.
+AUTHOR=Your Name
+
+# Space-separated dates to never log (vacation, public holidays).
+SKIP_DATES="2026-08-04 2026-08-05"

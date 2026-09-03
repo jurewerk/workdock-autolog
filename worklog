@@ -1,0 +1,560 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * Log time to a Workdock instance.
+ *
+ * Everything goes to one task; each entry is just a Jira ticket + short description
+ * and a duration. Start times run sequentially from --start, so a 3:00 entry at 08:00
+ * puts the next one at 11:00.
+ *
+ * Usage:
+ *   php worklog.php "VEL-239 - faq" 3:00 ["VEL-236 - review fixes" 4:30 ...]
+ *
+ * Options:
+ *   --date=YYYY-MM-DD   day to log against          (default: today)
+ *   --start=HH:MM       first entry's start time    (default: 08:00)
+ *   --task=<ulid>       task to log against         (default: TASK_ID below)
+ *   --base=<url>        Workdock base URL           (default: WORKDOCK_BASE)
+ *   --dry-run           print the payloads, send nothing
+ *
+ * Auth (in order of preference):
+ *   WORKDOCK_COOKIE   full Cookie: header copied from the browser — no password needed
+ *   WORKDOCK_EMAIL + WORKDOCK_PASSWORD   logs in; credentials are AES-256-CBC encrypted
+ *                                        the way the SPA does it, per CryptoHelper
+ *   WORKDOCK_CIPHER_KEY   32-char key; falls back to VITE_ENCRYPTION_KEY in the local
+ *                         app's build (see README)
+ *
+ * The password is read from the environment and never written to disk or echoed.
+ */
+
+// Instance-specific values are configuration, not defaults baked into the tool:
+// the base URL and the task every entry is filed under differ per deployment.
+// Set WORKDOCK_BASE and WORKDOCK_TASK_ID in the config file (see the example).
+const DEFAULT_START = '08:00';
+
+$home = getenv('HOME') ?: sys_get_temp_dir();
+define('CONFIG_PATH', $home . '/.workdock.conf');
+define('SESSION_CACHE', $home . '/.cache/workdock/session-cookies');
+
+/**
+ * Credentials live in a mode-600 config file rather than on the command line, so
+ * nothing sensitive lands in shell history, `ps`, or a permission rule. Real
+ * environment variables still win, for one-off overrides.
+ */
+/**
+ * Per-deployment settings, required rather than defaulted so the tool carries no
+ * particular organisation's URLs or record ids.
+ */
+function workdockBase(): string
+{
+    $v = getenv('WORKDOCK_BASE') ?: '';
+    if ($v === '') {
+        fail('Set WORKDOCK_BASE (e.g. https://workdock.example.com) in ' . CONFIG_PATH . '.');
+    }
+    return rtrim($v, '/');
+}
+
+function workdockTaskId(): string
+{
+    $v = getenv('WORKDOCK_TASK_ID') ?: '';
+    if ($v === '') {
+        fail('Set WORKDOCK_TASK_ID (the task entries are filed under) in ' . CONFIG_PATH . '.');
+    }
+    return $v;
+}
+
+loadConfig();
+
+function loadConfig(): void
+{
+    if (!is_readable(CONFIG_PATH)) {
+        return;
+    }
+
+    foreach (file(CONFIG_PATH, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
+        $line = trim($line);
+
+        if ($line === '' || str_starts_with($line, '#')) {
+            continue;
+        }
+
+        [$name, $value] = array_pad(explode('=', $line, 2), 2, '');
+        $name = trim($name);
+
+        if ($name === '' || getenv($name) !== false) {
+            continue;
+        }
+
+        putenv($name . '=' . trim($value, " \t\"'"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Read mode: `worklog --show[=YYYY-MM-DD]` authenticates and dumps the calendar
+// for that date (default today). Used to see what is already logged before a
+// top-up so nothing is double-posted, and to learn the endpoint's response shape.
+// ---------------------------------------------------------------------------
+
+foreach ($argv as $arg) {
+    if ($arg === '--show' || str_starts_with($arg, '--show=')) {
+        $showDate = str_contains($arg, '=') ? substr($arg, strlen('--show=')) : date('Y-m-d');
+
+        if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $showDate)) {
+            fail("--show date must be YYYY-MM-DD, got '{$showDate}'.");
+        }
+
+        $base = workdockBase();
+        [$jar, $xsrf, $cookieHeader] = openSession($base);
+
+        $calendarUrl = $base . '/time-tracking/calendar?started_at=' . rawurlencode($showDate);
+        [$status, $body] = request('GET', $calendarUrl, null, $jar, $xsrf, $cookieHeader);
+
+        // A cached session may have expired — re-login once and retry.
+        if (($status === 401 || $status === 419) && $cookieHeader === null) {
+            login($base, $jar);
+            saveSession($jar);
+            $xsrf = xsrfFromJar($jar);
+            [$status, $body] = request('GET', $calendarUrl, null, $jar, $xsrf, $cookieHeader);
+        }
+
+        fwrite(STDERR, "GET /time-tracking/calendar?started_at={$showDate} -> {$status}\n");
+        echo $body, "\n";
+
+        exit($status >= 200 && $status < 300 ? 0 : 1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Arguments
+// ---------------------------------------------------------------------------
+
+$argvRest = array_slice($argv, 1);
+$options = [];
+$positional = [];
+
+foreach ($argvRest as $arg) {
+    if (str_starts_with($arg, '--')) {
+        [$name, $value] = array_pad(explode('=', substr($arg, 2), 2), 2, true);
+        $options[$name] = $value;
+        continue;
+    }
+    $positional[] = $arg;
+}
+
+if ($positional === [] || isset($options['help'])) {
+    fwrite(STDERR, "usage: php worklog.php \"VEL-239 - faq\" 3:00 [\"VEL-236 - fixes\" 4:30 ...]\n");
+    fwrite(STDERR, "       [--date=YYYY-MM-DD] [--start=HH:MM] [--task=<ulid>] [--base=<url>] [--dry-run]\n");
+    exit(1);
+}
+
+if (count($positional) % 2 !== 0) {
+    fail('Entries come in pairs: a description followed by a duration.');
+}
+
+$base = rtrim(is_string($options['base'] ?? null) ? $options['base'] : workdockBase(), '/');
+$taskId = is_string($options['task'] ?? null)
+    ? $options['task']
+    : (getenv('WORKDOCK_TASK_ID') ?: workdockTaskId());
+$date = is_string($options['date'] ?? null) ? $options['date'] : date('Y-m-d');
+$start = is_string($options['start'] ?? null) ? $options['start'] : DEFAULT_START;
+$dryRun = isset($options['dry-run']);
+
+if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) {
+    fail("--date must be YYYY-MM-DD, got '{$date}'.");
+}
+
+if (!preg_match('/^([01]?\d|2[0-3]):([0-5]\d)$/', $start)) {
+    fail("--start must be HH:MM, got '{$start}'.");
+}
+
+// Build the entries, walking the clock forward as each duration is consumed.
+$cursor = new DateTimeImmutable("{$date} {$start}");
+$entries = [];
+
+for ($i = 0; $i < count($positional); $i += 2) {
+    $description = trim($positional[$i]);
+    $duration = trim($positional[$i + 1]);
+
+    // Mirrors the server's own rule: hours:minutes, minutes 00-59.
+    if (!preg_match('/^(\d+):([0-5]?\d)$/', $duration, $m)) {
+        fail("'{$duration}' is not a valid duration — use H:MM (e.g. 3:00, 0:45).");
+    }
+
+    if ($description === '') {
+        fail('Descriptions cannot be empty.');
+    }
+
+    $minutes = ((int) $m[1] * 60) + (int) $m[2];
+
+    if ($minutes <= 0) {
+        fail("'{$duration}' is zero — the server rejects durations of 0.");
+    }
+
+    $entries[] = [
+        'description' => $description,
+        'duration' => $duration,
+        'minutes' => $minutes,
+        'started_at' => $cursor->format('Y-m-d\TH:i'),
+    ];
+
+    $cursor = $cursor->add(new DateInterval("PT{$minutes}M"));
+}
+
+$totalMinutes = array_sum(array_column($entries, 'minutes'));
+
+// ---------------------------------------------------------------------------
+// Show what will be sent
+// ---------------------------------------------------------------------------
+
+printf("%s  →  %s\n", $dryRun ? 'DRY RUN' : 'Logging to', $base . '/timers');
+printf("task %s\n\n", $taskId);
+
+foreach ($entries as $entry) {
+    printf("  %s  %5s   %s\n", $entry['started_at'], $entry['duration'], $entry['description']);
+}
+
+printf("\n  total %s across %d %s\n\n",
+    sprintf('%d:%02d', intdiv($totalMinutes, 60), $totalMinutes % 60),
+    count($entries),
+    count($entries) === 1 ? 'entry' : 'entries'
+);
+
+if ($dryRun) {
+    foreach ($entries as $entry) {
+        echo json_encode(payloadFor($entry, $taskId), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), "\n";
+    }
+    exit(0);
+}
+
+// ---------------------------------------------------------------------------
+// Session
+// ---------------------------------------------------------------------------
+
+[$jar, $xsrf, $cookieHeader] = openSession($base);
+$reloggedIn = false;
+
+// ---------------------------------------------------------------------------
+// Post the entries
+// ---------------------------------------------------------------------------
+
+$failed = 0;
+
+foreach ($entries as $entry) {
+    $payload = json_encode(payloadFor($entry, $taskId), JSON_UNESCAPED_SLASHES);
+
+    [$status, $body] = request('POST', $base . '/timers', $payload, $jar, $xsrf, $cookieHeader, json: true);
+
+    // A cached session may have expired — re-login once and retry this entry.
+    if (($status === 401 || $status === 419) && $cookieHeader === null && !$reloggedIn) {
+        login($base, $jar);
+        saveSession($jar);
+        $xsrf = xsrfFromJar($jar);
+        $reloggedIn = true;
+        [$status, $body] = request('POST', $base . '/timers', $payload, $jar, $xsrf, $cookieHeader, json: true);
+    }
+
+    // The app answers a successful Inertia POST with a 302 back to /time-tracking.
+    $ok = $status === 302 || ($status >= 200 && $status < 300);
+
+    printf("  [%s] %s  %5s  %s\n",
+        $ok ? ' ok ' : $status,
+        $entry['started_at'],
+        $entry['duration'],
+        $entry['description']
+    );
+
+    if ($ok) {
+        continue;
+    }
+
+    $failed++;
+
+    if ($status === 401 || $status === 419) {
+        fwrite(STDERR, "       not authenticated — refresh WORKDOCK_COOKIE, or drop it to log in again\n");
+        break;
+    }
+
+    fwrite(STDERR, '       ' . summarize($body) . "\n");
+}
+
+printf("\n%d of %d logged.\n", count($entries) - $failed, count($entries));
+
+exit($failed === 0 ? 0 : 1);
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * A shared session, cached across invocations.
+ *
+ * worklog logs in on every call, and the automation makes several calls per run;
+ * without caching, the repeated /login hits trip the server's 5-attempt rate
+ * limiter mid-run. The cookie jar is persisted (mode 600) and reused until a
+ * request comes back 401/419, at which point the caller re-logs in and re-saves.
+ *
+ * @return array{0:string,1:?string,2:?string} [jar, xsrf, cookieHeader]
+ */
+function openSession(string $base): array
+{
+    $cookieHeader = getenv('WORKDOCK_COOKIE') ?: null;
+    if ($cookieHeader !== null) {
+        $xsrf = xsrfFromCookieHeader($cookieHeader);
+        if ($xsrf === null) {
+            fail('WORKDOCK_COOKIE has no XSRF-TOKEN in it — copy the whole Cookie header.');
+        }
+
+        return [tempnam(sys_get_temp_dir(), 'workdock-cookies-'), $xsrf, $cookieHeader];
+    }
+
+    $jar = tempnam(sys_get_temp_dir(), 'workdock-cookies-');
+    register_shutdown_function(static fn () => @unlink($jar));
+
+    // Reuse a cached jar when present; its freshness is proven lazily by the
+    // first real request, which re-logs in on a 401/419.
+    if (is_readable(SESSION_CACHE) && filesize(SESSION_CACHE) > 0) {
+        copy(SESSION_CACHE, $jar);
+        $xsrf = xsrfFromJar($jar);
+        if ($xsrf !== null) {
+            return [$jar, $xsrf, null];
+        }
+    }
+
+    login($base, $jar);
+    saveSession($jar);
+
+    return [$jar, xsrfFromJar($jar), null];
+}
+
+function saveSession(string $jar): void
+{
+    $dir = dirname(SESSION_CACHE);
+    if (!is_dir($dir)) {
+        @mkdir($dir, 0700, true);
+    }
+    if (@copy($jar, SESSION_CACHE)) {
+        @chmod(SESSION_CACHE, 0600);
+    }
+}
+
+function payloadFor(array $entry, string $taskId): array
+{
+    return [
+        'customer_id' => null,
+        'description' => $entry['description'],
+        'duration' => $entry['duration'],
+        'started_at' => $entry['started_at'],
+        'task_id' => $taskId,
+    ];
+}
+
+/**
+ * The SPA encrypts the credentials before posting them, and LoginRequest decrypts
+ * with the same key — so a plaintext login is rejected outright.
+ */
+function login(string $base, string $jar): void
+{
+    // Pre-encrypted credentials, copied from the browser's own /login payload, are
+    // posted verbatim — the ciphertext is what the endpoint expects, so this path
+    // never needs the plaintext password at all.
+    $emailCipher = getenv('WORKDOCK_EMAIL_ENC') ?: null;
+    $passwordCipher = getenv('WORKDOCK_PASSWORD_ENC') ?: null;
+
+    if ($emailCipher === null || $passwordCipher === null) {
+        $email = getenv('WORKDOCK_EMAIL') ?: null;
+        $password = getenv('WORKDOCK_PASSWORD') ?: null;
+
+        if ($email === null || $password === null) {
+            fail('Set WORKDOCK_EMAIL_ENC + WORKDOCK_PASSWORD_ENC, or WORKDOCK_EMAIL + WORKDOCK_PASSWORD, or WORKDOCK_COOKIE.');
+        }
+
+        $key = cipherKey();
+        $emailCipher = encryptForWorkdock($email, $key);
+        $passwordCipher = encryptForWorkdock($password, $key);
+    }
+
+    // Prime the session so we have a CSRF token to send back.
+    request('GET', $base . '/login', null, $jar, null, null);
+    $xsrf = xsrfFromJar($jar);
+
+    if ($xsrf === null) {
+        fail("No XSRF-TOKEN came back from {$base}/login — is the host reachable?");
+    }
+
+    [$status, $body] = request(
+        'POST',
+        $base . '/login',
+        http_build_query([
+            'email' => $emailCipher,
+            'password' => $passwordCipher,
+            'remember' => 'false',
+        ]),
+        $jar,
+        $xsrf,
+        null,
+    );
+
+    // A successful login redirects; a rejected one comes back 422.
+    if ($status === 302 || ($status >= 200 && $status < 300)) {
+        return;
+    }
+
+    if (str_contains($body, 'Invalid encrypted credentials')) {
+        fail('The cipher key is wrong — set WORKDOCK_CIPHER_KEY to the key prod actually uses.');
+    }
+
+    fail("Login failed ({$status}): " . summarize($body));
+}
+
+/** Same scheme as App\Helpers\CryptoHelper: AES-256-CBC, random IV, base64(iv . ciphertext). */
+function encryptForWorkdock(string $plaintext, string $key): string
+{
+    $iv = random_bytes(16);
+    $ciphertext = openssl_encrypt($plaintext, 'AES-256-CBC', $key, OPENSSL_RAW_DATA, $iv);
+
+    if ($ciphertext === false) {
+        fail('Encryption failed.');
+    }
+
+    return base64_encode($iv . $ciphertext);
+}
+
+function cipherKey(): string
+{
+    // Config only. This used to fall back to reading the key out of a local checkout
+    // of the server app, which hardcoded one machine's path into the tool.
+    $key = getenv('WORKDOCK_CIPHER_KEY') ?: null;
+
+    if ($key === null) {
+        fail('No cipher key. Set WORKDOCK_CIPHER_KEY (32 characters).');
+    }
+
+    if (strlen($key) !== 32) {
+        fail('The cipher key must be exactly 32 characters for AES-256.');
+    }
+
+    return $key;
+}
+
+/**
+ * @return array{0:int,1:string} status and body
+ */
+function request(
+    string $method,
+    string $url,
+    ?string $body,
+    string $jar,
+    ?string $xsrf,
+    ?string $cookieHeader,
+    bool $json = false,
+): array {
+    $headers = ['Accept: application/json', 'X-Requested-With: XMLHttpRequest'];
+
+    if ($json) {
+        $headers[] = 'Content-Type: application/json';
+    } elseif ($body !== null) {
+        $headers[] = 'Content-Type: application/x-www-form-urlencoded';
+    }
+
+    if ($xsrf !== null) {
+        $headers[] = 'X-XSRF-TOKEN: ' . $xsrf;
+    }
+
+    if ($cookieHeader !== null) {
+        $headers[] = 'Cookie: ' . $cookieHeader;
+    }
+
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_CUSTOMREQUEST => $method,
+        CURLOPT_RETURNTRANSFER => true,
+        // Never follow the redirect: a 302 is the success signal, and following it
+        // would turn a rejected write into a misleading 200 from /time-tracking.
+        CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_HTTPHEADER => $headers,
+        CURLOPT_COOKIEJAR => $jar,
+        CURLOPT_COOKIEFILE => $jar,
+        CURLOPT_TIMEOUT => 30,
+    ]);
+
+    if ($body !== null) {
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
+    }
+
+    $response = curl_exec($ch);
+
+    if ($response === false) {
+        fail('Request failed: ' . curl_error($ch));
+    }
+
+    $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    return [$status, (string) $response];
+}
+
+function xsrfFromJar(string $jar): ?string
+{
+    if (!is_readable($jar)) {
+        return null;
+    }
+
+    foreach (file($jar, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
+        if ($line === '' || str_starts_with($line, '#')) {
+            continue;
+        }
+
+        $columns = explode("\t", $line);
+
+        if (count($columns) === 7 && $columns[5] === 'XSRF-TOKEN') {
+            return urldecode($columns[6]);
+        }
+    }
+
+    return null;
+}
+
+function xsrfFromCookieHeader(string $header): ?string
+{
+    foreach (explode(';', $header) as $pair) {
+        [$name, $value] = array_pad(explode('=', trim($pair), 2), 2, '');
+
+        if ($name === 'XSRF-TOKEN') {
+            return urldecode($value);
+        }
+    }
+
+    return null;
+}
+
+/** Pull something readable out of a JSON error body, else the first line of it. */
+function summarize(string $body): string
+{
+    $decoded = json_decode($body, true);
+
+    if (is_array($decoded)) {
+        if (isset($decoded['errors']) && is_array($decoded['errors'])) {
+            $messages = [];
+            foreach ($decoded['errors'] as $field => $fieldErrors) {
+                $messages[] = $field . ': ' . implode(' ', (array) $fieldErrors);
+            }
+
+            return implode('; ', $messages);
+        }
+
+        if (isset($decoded['message'])) {
+            return (string) $decoded['message'];
+        }
+    }
+
+    return trim(strtok($body, "\n") ?: '(empty response)');
+}
+
+function fail(string $message): never
+{
+    fwrite(STDERR, "error: {$message}\n");
+    exit(1);
+}

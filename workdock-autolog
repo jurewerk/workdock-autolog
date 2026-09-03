@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+"""
+Top the day up to 7.5h in Workdock from that day's git activity.
+
+Runs unattended from launchd at 22:00 — the same hour, and the same top-up model, as
+the harvest-autolog job this replaces. By then the day is over, so it completes a day
+rather than filling ahead.
+
+Conservative by construction: it reads the Workdock calendar first and posts only the
+shortfall, so a second run in the same day is a no-op rather than a double-log.
+Refuses weekends, future dates, configured skip dates, and days with no activity.
+
+Entries land in two fixed blocks, 08:00-13:30 and 14:00-16:00, packed from the start
+of each; an entry too long for the room left in the morning is split across the gap.
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from datetime import date, datetime, timedelta
+
+HOME = os.path.expanduser("~")
+
+# --- Scheduler environment -------------------------------------------------------
+# launchd starts a job with PATH=/usr/bin:/bin:/usr/sbin:/sbin, which has none of
+# python3, php, git or claude on it, and with USER unset — and `claude` reports "Not
+# logged in" when USER is unset even though the keychain item is readable. The plist
+# sets all of this, but it is repeated here so a hand-run or a regenerated plist
+# cannot quietly reintroduce the failure that made harvest-autolog log nothing for
+# three nights.
+for _d in (f"{HOME}/.local/bin", "/opt/homebrew/bin", "/usr/local/bin"):
+    if _d not in os.environ.get("PATH", "").split(":"):
+        os.environ["PATH"] = f"{_d}:{os.environ.get('PATH', '')}"
+os.environ.setdefault("HOME", HOME)
+if not os.environ.get("USER"):
+    try:
+        os.environ["USER"] = subprocess.run(["id", "-un"], capture_output=True,
+                                            text=True, timeout=10).stdout.strip()
+    except Exception:                                           # noqa: BLE001
+        pass
+
+WORKLOG = os.path.join(HOME, ".local/bin/worklog")
+CONFIG = os.path.join(HOME, ".workdock-autolog.conf")
+EMAIL_CONF = os.path.join(HOME, ".workdock.conf")
+LOG_DIR = os.path.join(HOME, ".local/share/workdock-autolog")
+LOG_FILE = os.path.join(LOG_DIR, "workdock-autolog.log")
+LABEL = "com.workdock-autolog.daily"
+PLIST = os.path.join(HOME, f"Library/LaunchAgents/{LABEL}.plist")
+
+DAILY_TARGET_MIN = 450                      # 7.5h, every workday
+BLOCKS = [(8 * 60, 13 * 60 + 30),           # 08:00-13:30 = 330m
+          (14 * 60, 16 * 60)]               # 14:00-16:00 = 120m
+SERVER_UTC_OFFSET_MIN = 120                 # server reads naive local time as Belgrade
+
+
+def log(msg):
+    line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}"
+    print(line, flush=True)
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(LOG_FILE, "a") as fh:
+            fh.write(line + "\n")
+    except Exception:                                           # noqa: BLE001
+        pass
+
+
+def die(msg):
+    """Preflight failures go to the log too, so --status shows them."""
+    log(f"FATAL: {msg}")
+    sys.exit(1)
+
+
+def read_conf(path):
+    conf = {}
+    if not os.path.exists(path):
+        return conf
+    for line in open(path):
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        conf[k.strip()] = v.strip().strip('"').strip("'")
+    return conf
+
+
+def my_email():
+    return read_conf(EMAIL_CONF).get("WORKDOCK_EMAIL", "")
+
+
+def repos():
+    out = []
+    for p in re.split(r"[,\n]", read_conf(CONFIG).get("REPOS", "")):
+        p = os.path.expanduser(p.strip())
+        if p and os.path.isdir(os.path.join(p, ".git")):
+            out.append(p)
+    return out
+
+
+def git_author():
+    """Required, not defaulted — the tool ships with nobody's name in it."""
+    return read_conf(CONFIG).get("AUTHOR", "").strip()
+
+
+def skip_dates():
+    return set(read_conf(CONFIG).get("SKIP_DATES", "").split())
+
+
+def preflight():
+    if not os.path.exists(WORKLOG):
+        die(f"worklog missing at {WORKLOG}")
+    for tool in ("php", "git"):
+        if not shutil.which(tool):
+            die(f"required command not found on PATH: {tool} (PATH={os.environ['PATH']})")
+    if not repos():
+        die(f"no usable repos in {CONFIG}")
+    if not my_email():
+        die(f"WORKDOCK_EMAIL not set in {EMAIL_CONF}")
+    if not git_author():
+        die(f"AUTHOR not set in {CONFIG} (the git author to match)")
+
+
+def commits_for(day):
+    """
+    Every commit that author *wrote* that day, across all branches, in every repo.
+
+    Filtered on author date rather than with --since/--until, which match the
+    committer date: a cherry-pick or rebase rewrites that, so rebased work would be
+    credited to the day it was moved instead of the day it was done.
+    """
+    found = []
+    want = day.isoformat()
+    for repo in repos():
+        try:
+            out = subprocess.run(
+                ["git", "-C", repo, "log", "--all", "--no-merges",
+                 f"--author={git_author()}", "--date=short",
+                 "--pretty=format:%H%x1f%ad%x1f%s"],
+                capture_output=True, text=True, timeout=120,
+            ).stdout
+        except Exception as e:                                  # noqa: BLE001
+            log(f"  ! {repo}: {e}")
+            continue
+        seen = set()
+        for line in out.splitlines():
+            parts = line.split("\x1f", 2)
+            if len(parts) != 3:
+                continue
+            _sha, authored, subject = parts
+            if authored != want:
+                continue
+            subject = subject.strip()
+            # Keyed on the subject, not the sha: --all walks every branch including
+            # remote-tracking ones, so a cherry-picked commit appears twice under two
+            # shas — once where it was written, once where it was moved to.
+            if subject in seen:
+                continue
+            seen.add(subject)
+            found.append((os.path.basename(repo), subject))
+    return found
+
+
+def wip_for(day):
+    """
+    Uncommitted work, counted for today only. He commits late, so a day's real work
+    is often still in the working tree at 22:00 — harvest-autolog counted this and
+    this has to as well, or a heads-down day with one late commit under-logs.
+    """
+    if day != date.today():
+        return []
+    out = []
+    for repo in repos():
+        try:
+            dirty = subprocess.run(["git", "-C", repo, "status", "--porcelain"],
+                                   capture_output=True, text=True, timeout=60).stdout
+        except Exception:                                       # noqa: BLE001
+            continue
+        files = [l[3:].strip() for l in dirty.splitlines() if l.strip()]
+        if files:
+            out.append((os.path.basename(repo),
+                        f"work in progress in {len(files)} files: "
+                        + ", ".join(files[:6])))
+    return out
+
+
+def group(activity):
+    """One entry per ticket per day; everything untracketed collapses into one."""
+    buckets, order = {}, []
+    for _repo, subject in activity:
+        m = re.match(r"^\[?(VEL-\d+)\]?\s*[-:]?\s*(.*)$", subject)
+        key = m.group(1) if m else "_none"
+        text = (m.group(2) if m else subject).strip()
+        if key not in buckets:
+            buckets[key] = []
+            order.append(key)
+        if text:
+            buckets[key].append(text)
+    return [(k, buckets[k]) for k in order]
+
+
+def describe(ticket, subjects, already):
+    """`VEL-NNN - short description`, no brackets. Never invents a ticket id."""
+    text = claude_summary(subjects, already) or fallback_summary(subjects)
+    text = re.sub(r"\s+", " ", text).strip().rstrip(".")[:80]
+    return f"{ticket} - {text}" if ticket != "_none" else (text or "development")
+
+
+def fallback_summary(subjects):
+    if not subjects:
+        return "development"
+    best = max(subjects, key=len)                # the longest subject says the most
+    return best[0].lower() + best[1:] if best else best
+
+
+def claude_summary(subjects, already):
+    """Nicer wording when the CLI is available; never fatal when it is not."""
+    if not subjects or os.environ.get("WORKDOCK_AUTOLOG_NO_CLAUDE"):
+        return None
+    prompt = (
+        "Summarise this day's work as ONE time-entry description of at most 8 words. "
+        "Plain noun phrase, lower case, no ticket id, no quotes, no trailing period.\n\n"
+        + "\n".join(f"- {s}" for s in subjects[:20])
+    )
+    if already:
+        # So a second run of the same day reads as a continuation of the morning's
+        # entries rather than restating them.
+        prompt += ("\n\nAlready logged earlier today (do not restate these):\n"
+                   + "\n".join(f"- {a}" for a in already[:10]))
+    try:
+        r = subprocess.run(["claude", "-p", prompt],
+                           capture_output=True, text=True, timeout=90)
+        lines = (r.stdout or "").strip().splitlines()
+        return lines[0].strip() if lines and r.returncode == 0 else None
+    except Exception:                                           # noqa: BLE001
+        return None
+
+
+def calendar(day):
+    r = subprocess.run([WORKLOG, f"--show={day}"], capture_output=True, text=True, timeout=120)
+    if "{" not in r.stdout:
+        raise RuntimeError(f"calendar read failed: {(r.stderr or r.stdout)[:200]}")
+    return json.loads(r.stdout[r.stdout.index("{"):])
+
+
+def existing(day):
+    """(total minutes, minutes used per block, notes already logged) for me, that day."""
+    me = my_email()
+    used = [0 for _ in BLOCKS]
+    total, notes = 0, []
+    for t in calendar(day).get("timers", []):
+        if (t.get("user") or {}).get("email") != me:
+            continue
+        try:
+            when = datetime.strptime((t.get("started_at") or "")[:16], "%Y-%m-%dT%H:%M")
+        except ValueError:
+            continue
+        when += timedelta(minutes=SERVER_UTC_OFFSET_MIN)
+        if when.date() != day:
+            continue
+        dur = int(t.get("duration") or 0)
+        total += dur
+        if t.get("description"):
+            notes.append(t["description"])
+        start = when.hour * 60 + when.minute
+        for i, (bs, be) in enumerate(BLOCKS):
+            used[i] += max(0, min(start + dur, be) - max(start, bs))
+    return total, used, notes
+
+
+def plan(entries, remaining, used, already):
+    """Pack the shortfall into the free room of each block, splitting at the gap."""
+    room = [(bs + u, be - bs - u) for (bs, be), u in zip(BLOCKS, used)]
+    weights = [max(1, len(s)) for _t, s in entries]
+    scale = remaining / sum(weights)
+    mins = [max(15, int(round(w * scale / 15)) * 15) for w in weights]
+    while sum(mins) != remaining:
+        over = sum(mins) > remaining
+        i = mins.index(max(mins)) if over else mins.index(min(mins))
+        mins[i] += -15 if over else 15
+        if mins[i] < 15:
+            mins[i] = 15
+            break
+
+    posts, bi = [], 0
+    cursor, left = room[0]
+    for (ticket, subjects), want in zip(entries, mins):
+        desc = describe(ticket, subjects, already)
+        while want > 0:
+            while left <= 0 and bi + 1 < len(room):
+                bi += 1
+                cursor, left = room[bi]
+            if left <= 0:
+                log(f"  ! no room left in either block, dropping {want}m of {desc!r}")
+                break
+            take = min(want, left)
+            posts.append((desc, cursor, take))
+            cursor += take
+            left -= take
+            want -= take
+    return posts
+
+
+def run(day, dry, force_weekend):
+    if day.weekday() >= 5 and not force_weekend:
+        log(f"{day} is a {day:%A} — weekends are never logged.")
+        return 0
+    if day > date.today():
+        log(f"{day} is in the future — refusing.")
+        return 0
+    if day.isoformat() in skip_dates():
+        log(f"{day} is in SKIP_DATES — logging nothing.")
+        return 0
+
+    preflight()
+
+    activity = commits_for(day) + wip_for(day)
+    if not activity:
+        log(f"{day}: no activity by {git_author()} — logging nothing.")
+        return 0
+
+    total, used, already = existing(day)
+    remaining = DAILY_TARGET_MIN - total
+    log(f"{day}: {len(activity)} activity items, {total}m logged, {remaining}m short.")
+    if remaining <= 0:
+        log("  already at target — nothing to do.")
+        return 0
+
+    posts = plan(group(activity), remaining, used, already)
+    for desc, start, mins in posts:
+        log(f"  {start // 60:02d}:{start % 60:02d}  {mins // 60}:{mins % 60:02d}  {desc}")
+    if dry:
+        log("  (dry run — nothing posted)")
+        return 0
+
+    for desc, start, mins in posts:
+        r = subprocess.run(
+            [WORKLOG, f"--date={day}", f"--start={start // 60:02d}:{start % 60:02d}",
+             desc, f"{mins // 60}:{mins % 60:02d}"],
+            capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            log(f"  ! failed: {desc} :: {(r.stderr or r.stdout)[:200]}")
+            return 1
+    log(f"  posted {len(posts)} entries, day now at {DAILY_TARGET_MIN / 60:.2f}h.")
+    return 0
+
+
+PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{label}</string>
+  <key>ProgramArguments</key>
+  <array><string>/bin/bash</string><string>-lc</string><string>{script}</string></array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>{home}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key><string>{home}</string>
+    <key>USER</key><string>{user}</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>{hour}</integer><key>Minute</key><integer>0</integer></dict>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>{logdir}/launchd.out.log</string>
+  <key>StandardErrorPath</key><string>{logdir}/launchd.err.log</string>
+</dict>
+</plist>
+"""
+
+
+def install(hour):
+    os.makedirs(os.path.dirname(PLIST), exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
+    user = os.environ.get("USER") or os.path.basename(HOME)
+    open(PLIST, "w").write(PLIST_TEMPLATE.format(
+        label=LABEL, script=os.path.abspath(__file__), home=HOME,
+        user=user, hour=hour, logdir=LOG_DIR))
+    subprocess.run(["launchctl", "unload", PLIST], capture_output=True)
+    r = subprocess.run(["launchctl", "load", PLIST], capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"wrote {PLIST}\nload it yourself with:\n  launchctl load {PLIST}")
+        return 1
+    print(f"installed {LABEL} at {hour:02d}:00 — {PLIST}")
+    return 0
+
+
+def uninstall():
+    subprocess.run(["launchctl", "unload", PLIST], capture_output=True)
+    if os.path.exists(PLIST):
+        os.remove(PLIST)
+    print(f"removed {LABEL}")
+    return 0
+
+
+def main():
+    args = sys.argv[1:]
+    day = date.today()
+    dry = "--dry-run" in args
+    force_weekend = "--force-weekend" in args
+
+    for a in args:
+        if a.startswith("--date="):
+            day = datetime.strptime(a.split("=", 1)[1], "%Y-%m-%d").date()
+        elif a == "--yesterday":
+            day = date.today() - timedelta(days=1)
+
+    for a in args:
+        if a.startswith("--install"):
+            return install(int(a.split("=", 1)[1]) if "=" in a else 22)
+        if a == "--uninstall":
+            return uninstall()
+        if a == "--status":
+            loaded = subprocess.run(["launchctl", "list", LABEL],
+                                    capture_output=True).returncode == 0
+            total, used, notes = existing(day)
+            print(f"scheduler: {'loaded' if loaded else 'NOT loaded'}  ({PLIST})")
+            print(f"{day}: {total}m logged ({total / 60:.2f}h), per-block used {used}")
+            for n in notes:
+                print(f"   - {n}")
+            if os.path.exists(LOG_FILE):
+                print(f"\nlast log lines ({LOG_FILE}):")
+                for line in open(LOG_FILE).read().splitlines()[-6:]:
+                    print("   " + line)
+            return 0
+        if a == "--show":
+            for repo, s in commits_for(day) + wip_for(day):
+                print(f"  {repo}: {s}")
+            return 0
+
+    return run(day, dry, force_weekend)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
