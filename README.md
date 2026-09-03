@@ -17,6 +17,29 @@ lunch gap.
 It refuses to act on weekends, on future dates, on dates listed in `SKIP_DATES`, and
 on days with no activity at all.
 
+## Days that leave no trace in git
+
+Planning, calls, review, PM — work that produces no commits would otherwise log
+nothing, because commits are all the tool can see. Say what you did instead:
+
+```sh
+workdock-autolog --manual "sprint planning and roadmap review" \
+                 --manual "1:30 client call about Q4 scope" \
+                 --manual "backlog grooming"
+```
+
+An optional leading `H:MM` fixes that entry's length exactly; entries without one
+share out whatever is left of the day's target. So above, the call books exactly 1:30
+and the other two split the remaining 5:30 between them.
+
+Your wording is used **verbatim** — manual text is never passed through the
+summariser, because the point of typing it out is that these are your words.
+
+Manual items combine with commits on a mixed day, so a morning of coding and an
+afternoon of meetings comes out as both. Add `--manual-only` to ignore the day's
+commits entirely. A `VEL-123 - ...` prefix files the entry under that ticket; without
+one it is logged with a plain description, and no ticket id is ever invented.
+
 ## Install
 
 ```sh
@@ -45,6 +68,9 @@ Requires `php`, `git`, `python3`; uses the `claude` CLI for entry wording if pre
 | `workdock-autolog --yesterday` | ...or `--date=2026-09-02` |
 | `workdock-autolog --status` | agent loaded? day's total? tail of the log |
 | `workdock-autolog --show` | the activity a date would be derived from |
+| `workdock-autolog --manual "..."` | log work that has no commits; repeatable |
+| `workdock-autolog --manual "1:30 ..."` | ...with an exact duration |
+| `workdock-autolog --manual-only` | ignore commits, use only `--manual` items |
 | `workdock-autolog --force-weekend` | the only way to log a Saturday or Sunday |
 
 Logs to `~/.local/share/workdock-autolog/`.
@@ -89,6 +115,15 @@ what protects the account.
 What protects the account is the file. Treat `~/.workdock.conf` as you would any
 password file: mode 600, never committed. `.gitignore` covers `*.conf`, and both
 example files are placeholders only.
+
+## `WORKDOCK_TASK_ID`
+
+Every entry this tool creates is filed against a single Workdock task — the one your
+day-to-day work belongs to, typically a project's development task. Workdock has no
+public API, so the id is not discoverable from the outside; take it from the payload
+the web app itself sends. Open the time-tracking page with the browser devtools
+network tab recording, add an entry by hand, and read `task_id` off the `POST /timers`
+request. That value goes in `WORKDOCK_TASK_ID` and every entry lands there.
 
 Nothing instance-specific is baked into the tool: `WORKDOCK_BASE` and
 `WORKDOCK_TASK_ID` are required configuration, so no URL or record id from any

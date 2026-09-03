@@ -185,11 +185,14 @@ def wip_for(day):
     return out
 
 
+TICKET_RE = re.compile(r"^\[?([A-Z][A-Z0-9]+-\d+)\]?\s*[-:]?\s*(.*)$")
+
+
 def group(activity):
     """One entry per ticket per day; everything untracketed collapses into one."""
     buckets, order = {}, []
     for _repo, subject in activity:
-        m = re.match(r"^\[?(VEL-\d+)\]?\s*[-:]?\s*(.*)$", subject)
+        m = TICKET_RE.match(subject)
         key = m.group(1) if m else "_none"
         text = (m.group(2) if m else subject).strip()
         if key not in buckets:
@@ -197,12 +200,64 @@ def group(activity):
             order.append(key)
         if text:
             buckets[key].append(text)
-    return [(k, buckets[k]) for k in order]
+    return [{"ticket": k, "subjects": buckets[k], "fixed": None, "manual": False}
+            for k in order]
 
 
-def describe(ticket, subjects, already):
+def parse_manual(args):
+    """
+    `--manual "sprint planning with the client"`, repeatable, with an optional leading
+    duration: `--manual "1:30 sprint planning"`.
+
+    This is the entry point for work that leaves no trace in git — planning, calls,
+    reviews, PM. Without it a day of that logs nothing at all, because the tool has
+    only commits to go on.
+
+    A leading `H:MM` fixes that entry's length exactly; items without one share out
+    whatever is left of the day's target. A `VEL-123 - ...` style prefix is recognised
+    so manual work can still be filed under a ticket, but none is ever invented.
+    """
+    items, i = [], 0
+    while i < len(args):
+        a = args[i]
+        text = None
+        if a.startswith("--manual="):
+            text = a.split("=", 1)[1]
+        elif a == "--manual" and i + 1 < len(args):
+            text = args[i + 1]
+            i += 1
+        i += 1
+        if text is None:
+            continue
+
+        text = text.strip()
+        fixed = None
+        m = re.match(r"^(\d+):([0-5]\d)\s+(.*)$", text)
+        if m:
+            fixed = int(m.group(1)) * 60 + int(m.group(2))
+            text = m.group(3).strip()
+        if not text:
+            continue
+
+        t = TICKET_RE.match(text)
+        items.append({
+            "ticket": t.group(1) if t else "_none",
+            # Kept whole and used verbatim — the point of typing it out is that these
+            # are your words, not a summary of a commit.
+            "subjects": [(t.group(2) if t else text).strip()],
+            "fixed": fixed,
+            "manual": True,
+        })
+    return items
+
+
+def describe(entry, already):
     """`VEL-NNN - short description`, no brackets. Never invents a ticket id."""
-    text = claude_summary(subjects, already) or fallback_summary(subjects)
+    ticket, subjects = entry["ticket"], entry["subjects"]
+    if entry["manual"]:
+        text = subjects[0]            # verbatim: you typed it, so it is not rewritten
+    else:
+        text = claude_summary(subjects, already) or fallback_summary(subjects)
     text = re.sub(r"\s+", " ", text).strip().rstrip(".")[:80]
     return f"{ticket} - {text}" if ticket != "_none" else (text or "development")
 
@@ -269,24 +324,53 @@ def existing(day):
     return total, used, notes
 
 
+def allocate(entries, remaining):
+    """
+    Minutes per entry: entries given an explicit duration keep it exactly, and the
+    rest of the day's shortfall is shared out among those that were not.
+    """
+    fixed_total = sum(e["fixed"] for e in entries if e["fixed"])
+    flexible = [e for e in entries if not e["fixed"]]
+
+    if fixed_total > remaining:
+        log(f"  ! fixed durations total {fixed_total}m, more than the {remaining}m "
+            f"left in the day — logging them anyway, day will exceed target.")
+
+    share = remaining - fixed_total
+    mins = {}
+
+    if flexible and share > 0:
+        weights = [max(1, len(e["subjects"])) for e in flexible]
+        scale = share / sum(weights)
+        vals = [max(15, int(round(w * scale / 15)) * 15) for w in weights]
+        while sum(vals) != share:
+            over = sum(vals) > share
+            i = vals.index(max(vals)) if over else vals.index(min(vals))
+            vals[i] += -15 if over else 15
+            if vals[i] < 15:
+                vals[i] = 15
+                break
+        for e, v in zip(flexible, vals):
+            mins[id(e)] = v
+    elif flexible:
+        log(f"  ! no room left after fixed durations — skipping "
+            f"{len(flexible)} unsized entr{'y' if len(flexible) == 1 else 'ies'}.")
+
+    for e in entries:
+        if e["fixed"]:
+            mins[id(e)] = e["fixed"]
+
+    return [(e, mins.get(id(e), 0)) for e in entries if mins.get(id(e), 0) > 0]
+
+
 def plan(entries, remaining, used, already):
     """Pack the shortfall into the free room of each block, splitting at the gap."""
     room = [(bs + u, be - bs - u) for (bs, be), u in zip(BLOCKS, used)]
-    weights = [max(1, len(s)) for _t, s in entries]
-    scale = remaining / sum(weights)
-    mins = [max(15, int(round(w * scale / 15)) * 15) for w in weights]
-    while sum(mins) != remaining:
-        over = sum(mins) > remaining
-        i = mins.index(max(mins)) if over else mins.index(min(mins))
-        mins[i] += -15 if over else 15
-        if mins[i] < 15:
-            mins[i] = 15
-            break
 
     posts, bi = [], 0
     cursor, left = room[0]
-    for (ticket, subjects), want in zip(entries, mins):
-        desc = describe(ticket, subjects, already)
+    for entry, want in allocate(entries, remaining):
+        desc = describe(entry, already)
         while want > 0:
             while left <= 0 and bi + 1 < len(room):
                 bi += 1
@@ -302,7 +386,7 @@ def plan(entries, remaining, used, already):
     return posts
 
 
-def run(day, dry, force_weekend):
+def run(day, dry, force_weekend, manual, manual_only):
     if day.weekday() >= 5 and not force_weekend:
         log(f"{day} is a {day:%A} — weekends are never logged.")
         return 0
@@ -315,19 +399,25 @@ def run(day, dry, force_weekend):
 
     preflight()
 
-    activity = commits_for(day) + wip_for(day)
-    if not activity:
-        log(f"{day}: no activity by {git_author()} — logging nothing.")
+    # Manual items are activity in their own right: a day of planning, calls or review
+    # leaves nothing in git, and would otherwise log nothing at all.
+    entries = [] if manual_only else group(commits_for(day) + wip_for(day))
+    entries += manual
+
+    if not entries:
+        log(f"{day}: no commits by {git_author()} and no --manual items — "
+            f"logging nothing.")
         return 0
 
     total, used, already = existing(day)
     remaining = DAILY_TARGET_MIN - total
-    log(f"{day}: {len(activity)} activity items, {total}m logged, {remaining}m short.")
+    kinds = f"{len(entries)} entries" + (f" ({len(manual)} manual)" if manual else "")
+    log(f"{day}: {kinds}, {total}m logged, {remaining}m short.")
     if remaining <= 0:
         log("  already at target — nothing to do.")
         return 0
 
-    posts = plan(group(activity), remaining, used, already)
+    posts = plan(entries, remaining, used, already)
     for desc, start, mins in posts:
         log(f"  {start // 60:02d}:{start % 60:02d}  {mins // 60}:{mins % 60:02d}  {desc}")
     if dry:
@@ -398,6 +488,8 @@ def main():
     day = date.today()
     dry = "--dry-run" in args
     force_weekend = "--force-weekend" in args
+    manual = parse_manual(args)
+    manual_only = "--manual-only" in args
 
     for a in args:
         if a.startswith("--date="):
@@ -424,11 +516,14 @@ def main():
                     print("   " + line)
             return 0
         if a == "--show":
-            for repo, s in commits_for(day) + wip_for(day):
-                print(f"  {repo}: {s}")
+            for repo, subject in commits_for(day) + wip_for(day):
+                print(f"  {repo}: {subject}")
+            for m in manual:
+                fixed = f"[{m['fixed'] // 60}:{m['fixed'] % 60:02d}] " if m["fixed"] else ""
+                print(f"  manual: {fixed}{m['subjects'][0]}")
             return 0
 
-    return run(day, dry, force_weekend)
+    return run(day, dry, force_weekend, manual, manual_only)
 
 
 if __name__ == "__main__":
